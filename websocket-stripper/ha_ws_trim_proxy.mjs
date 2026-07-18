@@ -42,14 +42,17 @@ const inAddon = !!process.env.SUPERVISOR_TOKEN;
 // Bump together with config.yaml `version`. Logged at boot so the add-on log shows exactly
 // which code is running — the only reliable way to tell a Rebuild actually picked up changes
 // (a local add-on bakes in whatever files are in the host's /addons folder, not GitHub).
-const VERSION = '0.1.1';
+const VERSION = '0.2.0';
 
 const toList = (v) => (Array.isArray(v) ? v : String(v ?? '').split(/[\n,]/))
   .map((s) => String(s).trim()).filter(Boolean);
 
 const HA_BASE = process.env.HA_BASE || OPT.ha_base || (inAddon ? 'http://homeassistant:8123' : 'http://homeassistant.mgmt:8123');
 const HA_WS = HA_BASE.replace(/^http/, 'ws') + '/api/websocket';     // browser ws relay target
-const PORT = parseInt(process.env.PORT || '8099', 10);
+// Port precedence: PORT env (dev) > `port` add-on option > 8099. Under host_network the
+// add-on binds this directly on the host, so the option is the only way to move it off
+// 8099 (the Network tab can't remap a host-network port) — see issue #6.
+const PORT = parseInt(process.env.PORT || OPT.port || '8099', 10);
 const DASH_PATHS = toList(OPT.dashboards ?? (process.env.DASH_PATHS || process.env.DASH_PATH));
 // strip_entities: true (default) = inject the allowlist so HA streams only needed entities.
 //   false = pass the websocket straight through (full firehose) for A/B comparison.
@@ -79,14 +82,20 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 let ALLOW = new Set();
 
+// HA events that can change the computed allowlist: a dashboard edit, or a registry change
+// that alters what an area/label/device/integration auto-entities filter resolves to.
+const WATCH_EVENTS = ['lovelace_updated', 'entity_registry_updated', 'device_registry_updated', 'area_registry_updated', 'label_registry_updated'];
+
 // Allowlist for one dashboard = entities used across ALL its views. Two passes unioned:
 //  1) structured walk (explicit cards + auto-entities filter expansion)
 //  2) every REAL entity id appearing anywhere in the config text (catches ids inside
 //     button-card / mushroom-template / decluttering templates the walker can't parse).
 // Over-including is harmless (still tiny vs the instance); under-including breaks cards.
-function allowlistFor(cfg, states) {
+function allowlistFor(cfg, states, registries) {
   const real = new Set(states.map((s) => s.entity_id));
-  const out = new Set(extractEntities(cfg, states).entities);   // all views
+  // overInclude: forward every entity a card COULD show (don't shrink on volatile
+  // state/attributes filters); registries resolve area/label/device/integration filters.
+  const out = new Set(extractEntities(cfg, states, { registries, overInclude: true }).entities);
   const text = JSON.stringify(cfg);
   const re = /[a-z_][a-z0-9_]*\.[a-z0-9_]+/g;
   let m;
@@ -94,15 +103,31 @@ function allowlistFor(cfg, states) {
   return out;
 }
 
+// Fetch the area/device/entity/label registries so auto-entities `area`/`label`/`device`/
+// `integration` filters resolve (issue #4). Each is optional — on older HA or a permission
+// error we degrade to the pre-registry behavior (those filters just match nothing) rather
+// than failing the whole allowlist build.
+async function fetchRegistries(rpc) {
+  const get = async (type) => { try { return await rpc({ type }); } catch (e) { log(`  registry ${type} unavailable: ${e.message}`); return []; } };
+  const [areas, devices, entities, labels] = await Promise.all([
+    get('config/area_registry/list'),
+    get('config/device_registry/list'),
+    get('config/entity_registry/list'),
+    get('config/label_registry/list'),
+  ]);
+  return { areas, devices, entities, labels };
+}
+
 // Build the union allowlist over all configured dashboards using an authed rpc().
 async function buildAllow(rpc) {
   const states = await rpc({ type: 'get_states' });
   const realIds = states.map((s) => s.entity_id);
+  const registries = await fetchRegistries(rpc);
   const union = new Set();
   for (const p of DASH_PATHS) {
     try {
       const cfg = await rpc({ type: 'lovelace/config', url_path: p });
-      const set = allowlistFor(cfg, states);
+      const set = allowlistFor(cfg, states, registries);
       log(`  ${p}: ${set.size} entities`);
       set.forEach((e) => union.add(e));
     } catch (e) { log(`  ${p}: FAILED ${e.message}`); }
@@ -116,6 +141,22 @@ async function buildAllow(rpc) {
   [...union].forEach((eid) => { if (matchesAny(NEVER, eid)) union.delete(eid); });
   log(`overrides: base ${baseN}, +always ${afterAlways - baseN}, -never ${afterAlways - union.size}`);
   return union;
+}
+
+// Swap in a freshly-computed allowlist and log exactly what changed — the entity ids
+// added and removed, not just the new total (issue #7). This makes it visible from the
+// add-on log whether a dashboard edit's recompute actually picked up the entities you
+// expect. Remember: the new list only affects NEW ws connections — an already-open kiosk
+// page must be reloaded to use it.
+function applyAllow(next, why) {
+  const added = [...next].filter((e) => !ALLOW.has(e)).sort();
+  const removed = [...ALLOW].filter((e) => !next.has(e)).sort();
+  ALLOW = next;
+  const fmt = (a) => (a.length > 25 ? `${a.slice(0, 25).join(', ')} …(+${a.length - 25} more)` : a.join(', '));
+  log(`allowlist ${why}: ${ALLOW.size} entities (+${added.length} -${removed.length})`);
+  if (added.length) log(`  +added: ${fmt(added)}`);
+  if (removed.length) log(`  -removed: ${fmt(removed)}`);
+  if (!added.length && !removed.length) log('  (no change — reload open kiosk pages only if you expected one)');
 }
 
 // ---- persistent control connection: compute the allowlist + watch for dashboard edits ----
@@ -138,7 +179,7 @@ function startController() {
       const scheduleRecompute = (why) => {
         clearTimeout(recomputeTimer);
         recomputeTimer = setTimeout(async () => {
-          try { ALLOW = await buildAllow(rpc); log(`allowlist recomputed (${why}): ${ALLOW.size} entities`); }
+          try { applyAllow(await buildAllow(rpc), `recomputed (${why})`); }
           catch (e) { log('recompute failed:', e.message); }
         }, 1500);
       };
@@ -150,18 +191,23 @@ function startController() {
         if (m.type === 'auth_ok') {
           try {
             backoff = 1000;
-            ALLOW = await buildAllow(rpc);
-            if (!settled) { settled = true; resolve(ALLOW); }
-            else log(`allowlist recomputed (reconnect): ${ALLOW.size} entities`);
-            await rpc({ type: 'subscribe_events', event_type: 'lovelace_updated' });
-            log('watching lovelace_updated for live allowlist updates');
+            const next = await buildAllow(rpc);
+            if (!settled) { ALLOW = next; settled = true; resolve(ALLOW); }
+            else applyAllow(next, 'recomputed (reconnect)');
+            // lovelace_updated -> a dashboard's cards changed. The *_registry_updated
+            // events -> a device moved area, a label was (un)assigned, etc., which can
+            // change what an area/label/device/integration auto-entities filter resolves
+            // to (issue #4). Rebuild (debounced) on any of them.
+            for (const ev of WATCH_EVENTS) await rpc({ type: 'subscribe_events', event_type: ev });
+            log(`watching ${WATCH_EVENTS.join(', ')} for live allowlist updates`);
           } catch (e) { if (!settled) { settled = true; reject(e); } else log('post-auth setup failed:', e.message); }
           return;
         }
-        if (m.type === 'event' && m.event?.event_type === 'lovelace_updated') {
-          const p = m.event.data?.url_path ?? '(default)';
-          log(`lovelace_updated: ${p}`);
-          scheduleRecompute(p);
+        if (m.type === 'event' && WATCH_EVENTS.includes(m.event?.event_type)) {
+          const ev = m.event.event_type;
+          const why = ev === 'lovelace_updated' ? (m.event.data?.url_path ?? '(default)') : ev;
+          log(`${ev}: ${ev === 'lovelace_updated' ? why : ''}`.trim());
+          scheduleRecompute(why);
           return;
         }
         if (m.type === 'result' && pending[m.id]) { const p = pending[m.id]; m.success ? p[0](m.result) : p[1](new Error(JSON.stringify(m.error))); delete pending[m.id]; }
@@ -224,6 +270,7 @@ server.on('upgrade', (req, socket, head) => {
 function bridge(browserWs) {
   const haWs = new WebSocket(HA_WS, { perMessageDeflate: true, maxPayload: 0 });
   const getStatesIds = new Set();
+  const subEntityIds = new Set();   // subscribe_entities subs we injected the allowlist into
   const queue = []; let haOpen = false;
   const toHA = (s) => { if (haOpen) haWs.send(s); else queue.push(s); };
 
@@ -235,8 +282,10 @@ function bridge(browserWs) {
     if (STRIP && m && m.type === 'get_states') getStatesIds.add(m.id);
     if (STRIP && m && m.type === 'subscribe_entities' && !m.entity_ids) {
       m.entity_ids = [...ALLOW];           // HA now streams only the allowlist
+      subEntityIds.add(m.id);              // remember it, to defensively re-filter its events
       s = JSON.stringify(m);
     }
+    if (m && m.type === 'unsubscribe_events' && m.subscription != null) subEntityIds.delete(m.subscription);
     toHA(s);
   });
 
@@ -249,6 +298,26 @@ function bridge(browserWs) {
       getStatesIds.delete(m.id);
       s = JSON.stringify(m);
       log(`get_states trimmed ${before} -> ${m.result.length}`);
+    }
+    // Defensive egress filter (belt-and-suspenders): HA already trims to the injected
+    // entity_ids, so this is normally a no-op. But if a future HA ever ignored that
+    // filter, re-filter the subscribe_entities event payload to the allowlist here so
+    // the full firehose can never leak to the browser. Compressed format: a=added,
+    // c=changed (both dicts keyed by entity_id), r=removed (list of entity_ids).
+    // (Adapted from PR #1 / DragonHunter274's homeassistant-entity-filter-proxy.)
+    if (STRIP && m && m.type === 'event' && subEntityIds.has(m.id) && m.event) {
+      const ev = m.event; let changed = false;
+      for (const k of ['a', 'c']) {
+        if (ev[k]) for (const eid of Object.keys(ev[k])) {
+          if (!ALLOW.has(eid)) { delete ev[k][eid]; changed = true; }
+        }
+      }
+      if (Array.isArray(ev.r)) {
+        const before = ev.r.length;
+        ev.r = ev.r.filter((eid) => ALLOW.has(eid));
+        if (ev.r.length !== before) changed = true;
+      }
+      if (changed) s = JSON.stringify(m);
     }
     safeSend(s);
   });

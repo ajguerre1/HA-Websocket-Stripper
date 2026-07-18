@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0 — 2026-07-18
+
+- **auto-entities `area` / `label` / `device` / `integration` filters now resolve** (#4).
+  The proxy fetches the area/device/entity/label registries and expands these filters the
+  way HA's frontend does, instead of silently forwarding nothing — so cards filtered by
+  label/area no longer show entities as "unavailable" and you don't have to hand-list them
+  in `always_forward`. Volatile filters (`state` / `attributes`) now over-include (an
+  entity that doesn't match right now is still forwarded so the card can show it when it
+  does). The allowlist also rebuilds on registry changes, not just dashboard edits.
+- **Configurable `port` option** (#6) — move the add-on off `8099` when it collides with
+  another add-on (e.g. Zigbee2MQTT). Needed because `host_network` makes the Network tab
+  unable to remap the port.
+- **Allowlist recompute now logs the added/removed entity diff** (#7), not just the total,
+  so you can see exactly what a dashboard edit changed.
+- **Defensive egress filter** (PR #1): `subscribe_entities` event payloads (`a`/`c`/`r`)
+  are re-filtered to the allowlist on the way to the browser — a no-op today, but a
+  guarantee the firehose can't leak if a future HA ignored the `entity_ids` subscription.
+- Added a test suite (`npm test`, `node --test`): unit tests for the extractor + registry
+  resolver, and integration tests that spawn the real proxy against a mock HA.
+
 ## 0.0.1 — 2026-06-19
 
 Initial public release.

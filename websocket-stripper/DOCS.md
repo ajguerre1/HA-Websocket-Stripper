@@ -12,6 +12,7 @@ uses, so kiosk/wall-panel pages load fast on large instances — with no loss of
 | `always_forward` | list | Entities to forward even if no listed dashboard uses them. Each item is a literal `entity_id` or a `/regex/` (matched against all entities). |
 | `never_forward` | list | Entities to never forward. Applied last — **wins** over `always_forward` and dashboard detection. Literal or `/regex/`. |
 | `strip_entities` | bool | `true` (default) strips the websocket to the allowlist. `false` = full passthrough (for A/B comparison). |
+| `port` | int | Port the add-on listens on (default `8099`). Because it runs with `host_network: true`, this option is how you move it off `8099` — the **Network** tab can't remap a host-network port. Change it if `8099` collides with another add-on (e.g. Zigbee2MQTT). |
 | `ha_base` | string | Optional. Override the Home Assistant base URL the add-on proxies to (default `http://homeassistant:8123`). Set this if `host_network` is on and the internal `homeassistant` hostname doesn't resolve — e.g. `http://192.168.4.2:8123`. |
 | `allow_ws_url` | string | Optional. Override the websocket URL used once at startup to precompute the allowlist (default `ws://supervisor/core/websocket`). Set if `supervisor` doesn't resolve under `host_network` — e.g. `ws://192.168.4.2:8123/api/websocket` (also requires a token via `ALLOW_TOKEN`). |
 
@@ -36,8 +37,11 @@ backslashes must be escaped (`"\\."`).
 ## Usage
 
 After starting, browse to `http://<ha-host>:8099/<dashboard-url-path>`, e.g.
-`http://homeassistant.local:8099/fridge-status`. The host port is remappable on the
-**Network** tab. Point your kiosk browser at that URL.
+`http://homeassistant.local:8099/fridge-status`. Point your kiosk browser at that URL.
+
+> **Port:** because this add-on runs with `host_network: true` (see the tradeoff below),
+> it binds directly on the host and the **Network** tab cannot remap it. If `8099` collides
+> with another add-on (e.g. Zigbee2MQTT), set the `port` option instead.
 
 The first visit prompts a normal HA login (it's a different origin); after that it's your
 real dashboard.
@@ -68,6 +72,36 @@ homeassistant:
 ```
 
 Then `ha core restart` (a full restart — `http:` changes need it).
+
+### Why `host_network` is on — and what it costs
+
+This add-on ships with `host_network: true` on purpose. That single flag is a tradeoff, so
+here is exactly what you get and what you give up.
+
+**What it buys you.** The add-on shares the host's network stack instead of Docker's
+bridged network, so HA sees the **browser's real LAN IP**. That is the *only* clean way to
+make the trusted-network (password-less) kiosk login above work: in bridged mode Docker
+NATs every client to the gateway `172.30.32.1` before the proxy sees it, so the kiosk's
+real IP never reaches HA and `trusted_networks` can't match it.
+
+**What it costs.**
+
+- **The port is rigid.** It binds `:8099` on the host directly; the **Network** tab can't
+  remap it, so a clash with another add-on on `8099` can't be fixed there (see #6 above).
+- **Internal DNS can break.** The `homeassistant` and `supervisor` hostnames may not
+  resolve in host-network mode. If startup fails, pin them to IPs with the `ha_base` and
+  `allow_ws_url` options (e.g. `ha_base: http://192.168.4.2:8123`).
+- **HA sees the request from the host itself**, so `trusted_proxies` must list
+  `127.0.0.1`/`::1` (and optionally the host LAN IP) — not the Docker gateway subnet.
+
+**If you don't need password-less-by-IP login**, none of the above helps you and bridged
+mode is simpler (free port remapping, working DNS). Some users run a locally-modified copy
+with `host_network: false` for exactly that reason. It is not exposed as an option because
+`host_network` is a build-time add-on setting, not a runtime one — changing it means
+editing `config.yaml` and rebuilding. If you log in normally (or with a token) and don't
+rely on trusted-network auto-login, that's a reasonable local change; you then trim the
+port via the Network tab as usual. The default stays `true` so the documented kiosk login
+keeps working out of the box.
 
 ## Notes & limits
 
