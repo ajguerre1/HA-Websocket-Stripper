@@ -225,3 +225,6 @@ node_modules/
 secrets.local.json
 *.local.json
 secrets.local.*
+
+# Local dev MCP config (chrome-devtools-mcp) — not for the public add-on repo
+.mcp.json
