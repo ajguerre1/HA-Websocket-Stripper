@@ -48,6 +48,14 @@ The **allowlist** is the union of the entities used by each configured dashboard
 scan for entity ids referenced inside templates), plus your `always_forward` and minus
 your `never_forward` overrides.
 
+`auto-entities` filter cards are expanded against your live entities **and registries**, so
+filters by `area`, `label`, `device`, and `integration` resolve the same way HA's frontend
+does (not just `domain` / `entity_id`). Volatile `state` / `attributes` filters
+over-include — an entity that doesn't match right now is still forwarded so the card can
+show it when it later does. The allowlist **recomputes live** when you edit a dashboard or
+change area/label/device assignments (no add-on restart needed); already-open kiosk pages
+just need a reload to pick up newly-added entities.
+
 ## Install as a Home Assistant add-on
 
 1. HA → **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, add:
@@ -62,8 +70,16 @@ your `never_forward` overrides.
    never_forward: []           # e.g. ["/_battery$/"]
    strip_entities: true
    ```
-3. Start it. Browse `http://<ha-host>:8099/fridge-status` (the port is remappable under
-   the add-on's **Network** tab). Point your kiosk/fridge browser there.
+3. Start it. Browse `http://<ha-host>:8099/fridge-status`. Point your kiosk/fridge browser
+   there. To move it off `8099` (e.g. it collides with Zigbee2MQTT), set the `port` option
+   — because the add-on runs `host_network: true`, the **Network** tab can't remap it.
+
+> **Tip — keep broad admin dashboards out of the `dashboards` list.** The allowlist is the
+> *union* of every listed dashboard, so a big admin/overview dashboard built on wide
+> `auto-entities` filters (`integration:`, whole-`area:`) can legitimately resolve to
+> thousands of entities and erase most of the trimming benefit. List only the lean kiosk
+> dashboards you actually serve; the trim is dramatic for those (dozens of entities) and
+> pointless for a dashboard that shows most of the instance anyway.
 
 No long-lived token needed in the add-on — it uses the add-on's `SUPERVISOR_TOKEN` to
 read the dashboard configs.
@@ -137,7 +153,26 @@ Set `STRIP_ENTITIES=0` to passthrough untrimmed for an A/B load comparison.
 
 - The frontend JS bundles still load (and are cached after first visit); this targets the
   per-load entity firehose, which is the part that scales with instance size.
-- The allowlist is computed at **startup**. Restart the add-on after editing a dashboard's
-  cards (auto-refresh on `lovelace_updated` is a planned improvement — see `CLAUDE.md`).
+- The allowlist **recomputes live** on dashboard edits and registry changes. Adding a whole
+  new dashboard to the `dashboards` option still needs an add-on restart (options are read
+  at boot). An already-open kiosk page must be **reloaded** to pick up newly-added entities.
+- Each recompute logs the exact `+added` / `-removed` entity diff, so you can see from the
+  add-on log what a dashboard edit changed.
 - See `CLAUDE.md` for architecture/decisions and `websocket-stripper/DOCS.md` for option
   details.
+
+## What's new in 0.2.0
+
+Full history in [`websocket-stripper/CHANGELOG.md`](websocket-stripper/CHANGELOG.md).
+
+- **auto-entities `area` / `label` / `device` / `integration` filters now resolve** against
+  the registries — cards filtered by label/area no longer show entities as "unavailable,"
+  and you don't have to hand-list them in `always_forward`. Volatile `state` / `attributes`
+  filters over-include so cards still update as state changes.
+- **Configurable `port` option** — coexist with other add-ons on busy hosts.
+- **Recompute now logs the `+added` / `-removed` entity diff**, not just the total.
+- **Defensive egress filter** re-filters `subscribe_entities` event payloads to the
+  allowlist on the way to the browser — a belt-and-suspenders guarantee the firehose can't
+  leak even if a future HA ignored the subscription filter.
+- Added a test suite (`cd websocket-stripper && npm test`): unit tests for the extractor +
+  registry resolver, and integration tests that run the real proxy against a mock HA.
