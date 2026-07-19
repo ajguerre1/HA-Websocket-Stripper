@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 — 2026-07-19
+
+- Remove the inert `ports:` / `ports_description` mapping from `config.yaml`. Under
+  `host_network` a Docker port map does nothing, so it only duplicated (and could drift
+  from) the functional `port` option. The `port` option is now the single source of truth
+  for the listen port. No behavior change — the add-on still binds `8099` by default.
+
 ## 0.2.0 — 2026-07-18
 
 - **auto-entities `area` / `label` / `device` / `integration` filters now resolve** (#4).
