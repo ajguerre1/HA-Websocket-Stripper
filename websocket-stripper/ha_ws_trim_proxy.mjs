@@ -29,7 +29,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import httpProxy from 'http-proxy';
 import { WebSocketServer, WebSocket } from 'ws';
-import { extractEntities } from './lovelace_extract.mjs';
+import { extractEntities, collectTemplates, expandGroupMembers } from './lovelace_extract.mjs';
 
 // ---- config (add-on options.json or env) ----
 function loadOptions() {
@@ -42,7 +42,7 @@ const inAddon = !!process.env.SUPERVISOR_TOKEN;
 // Bump together with config.yaml `version`. Logged at boot so the add-on log shows exactly
 // which code is running — the only reliable way to tell a Rebuild actually picked up changes
 // (a local add-on bakes in whatever files are in the host's /addons folder, not GitHub).
-const VERSION = '0.2.2';
+const VERSION = '0.2.3';
 
 const toList = (v) => (Array.isArray(v) ? v : String(v ?? '').split(/[\n,]/))
   .map((s) => String(s).trim()).filter(Boolean);
@@ -133,6 +133,9 @@ process.on('unhandledRejection', (e) => {
 });
 
 let ALLOW = new Set();
+// Every live browser <-> HA bridge, so a grown allowlist can reach already-open pages
+// (issue #7). See refreshOpenConnections().
+const openBridges = new Set();
 // False until the first allowlist lands. HA may still be booting when we start, and injecting
 // an EMPTY allowlist would render every card "unavailable" until a manual reload — so until
 // this flips we refuse /api/websocket upgrades instead (the frontend just keeps retrying).
@@ -147,16 +150,18 @@ const WATCH_EVENTS = ['lovelace_updated', 'entity_registry_updated', 'device_reg
 //  2) every REAL entity id appearing anywhere in the config text (catches ids inside
 //     button-card / mushroom-template / decluttering templates the walker can't parse).
 // Over-including is harmless (still tiny vs the instance); under-including breaks cards.
-function allowlistFor(cfg, states, registries) {
+function allowlistFor(cfg, states, registries, renderedTemplates) {
   const real = new Set(states.map((s) => s.entity_id));
   // overInclude: forward every entity a card COULD show (don't shrink on volatile
   // state/attributes filters); registries resolve area/label/device/integration filters.
-  const out = new Set(extractEntities(cfg, states, { registries, overInclude: true }).entities);
+  const out = new Set(extractEntities(cfg, states, { registries, overInclude: true, renderedTemplates }).entities);
   const text = JSON.stringify(cfg);
   const re = /[a-z_][a-z0-9_]*\.[a-z0-9_]+/g;
   let m;
   while ((m = re.exec(text))) if (real.has(m[0])) out.add(m[0]);
-  return out;
+  // Finally pull in group members: a card can name only the group (or expand it client-side
+  // via `show_group_members`) while the members appear nowhere in the config text (issue #4).
+  return expandGroupMembers(out, states);
 }
 
 // Fetch the area/device/entity/label registries so auto-entities `area`/`label`/`device`/
@@ -190,8 +195,26 @@ async function logAvailableDashboards(rpc) {
   }
 }
 
+// Render every `filter.template` in a dashboard config through HA, so auto-entities cards
+// whose entity list only exists after Jinja evaluation resolve too (issue #4). Best-effort
+// per template: a template that errors or times out just contributes nothing, exactly as
+// before, rather than failing the whole dashboard.
+async function renderTemplates(cfg, renderTemplate) {
+  const out = new Map();
+  if (!renderTemplate) return out;
+  const tpls = collectTemplates(cfg);
+  if (!tpls.length) return out;
+  const results = await Promise.all(tpls.map(async (t) => {
+    try { return [t, await renderTemplate(t)]; }
+    catch (e) { logThrottled(`tpl:${e.message}`, `  auto-entities template not rendered (${e.message})`); return null; }
+  }));
+  results.filter(Boolean).forEach(([t, r]) => out.set(t, r));
+  if (out.size) log(`  rendered ${out.size}/${tpls.length} auto-entities template filter(s)`);
+  return out;
+}
+
 // Build the union allowlist over all configured dashboards using an authed rpc().
-async function buildAllow(rpc) {
+async function buildAllow(rpc, renderTemplate) {
   const states = await rpc({ type: 'get_states' });
   const realIds = states.map((s) => s.entity_id);
   const registries = await fetchRegistries(rpc);
@@ -200,7 +223,8 @@ async function buildAllow(rpc) {
   for (const p of DASH_PATHS) {
     try {
       const cfg = await rpc({ type: 'lovelace/config', url_path: p });
-      const set = allowlistFor(cfg, states, registries);
+      const tpls = await renderTemplates(cfg, renderTemplate);
+      const set = allowlistFor(cfg, states, registries, tpls);
       log(`  ${p}: ${set.size} entities`);
       set.forEach((e) => union.add(e));
     } catch (e) { failed++; log(`  ${p}: FAILED ${e.message}`); }
@@ -248,7 +272,21 @@ function applyAllow(next, why, { merge = false } = {}) {
   log(`allowlist ${why}: ${ALLOW.size} entities (+${added.length} -${removed.length})`);
   if (added.length) log(`  +added: ${fmt(added)}`);
   if (removed.length) log(`  -removed: ${fmt(removed)}`);
-  if (!added.length && !removed.length) log('  (no change — reload open kiosk pages only if you expected one)');
+  if (!added.length && !removed.length) log('  (no change)');
+  if (added.length) refreshOpenConnections();
+}
+
+// `subscribe_entities` is sent ONCE per connection and HA has no way to amend a live
+// subscription, so a recompute only ever affected NEW connections — an already-open kiosk
+// kept streaming its original entity list until someone reloaded the tab (issue #7).
+// Dropping the browser socket fixes that: the HA frontend treats it as an ordinary
+// disconnect, reconnects on its own, and re-subscribes against the current allowlist.
+// Only on GROWTH. A shrink means the open page is carrying entities it no longer needs,
+// which is harmless — and churning every kiosk over a removal would be a bad trade.
+function refreshOpenConnections() {
+  if (!STRIP || !openBridges.size) return;
+  log(`  reconnecting ${openBridges.size} open dashboard connection(s) to pick up the new entities`);
+  for (const close of [...openBridges]) { try { close(); } catch {} }
 }
 
 // ---- persistent control connection: compute the allowlist + watch for dashboard edits ----
@@ -275,11 +313,35 @@ function startController() {
       let id = 1; const pending = {}; let gone = false;
       const rpc = (o) => { o.id = id++; return new Promise((res, rej) => { pending[o.id] = [res, rej]; ws.send(JSON.stringify(o)); }); };
 
+      // `render_template` is a SUBSCRIPTION, not a one-shot: HA answers `result` (null)
+      // immediately and then pushes an `event` carrying the rendered text, re-pushing it
+      // whenever a referenced entity changes. We want a single snapshot, so we take the
+      // first event and unsubscribe. Kept separate from rpc() precisely because rpc()
+      // resolves on `result`, which for this command carries no output. (issue #4)
+      const tplWaiters = new Map();
+      const settleTpl = (tplId, err, value) => {
+        const w = tplWaiters.get(tplId);
+        if (!w) return;
+        clearTimeout(w.timer);
+        tplWaiters.delete(tplId);
+        try { ws.send(JSON.stringify({ id: id++, type: 'unsubscribe_events', subscription: tplId })); } catch {}
+        err ? w.rej(err) : w.res(value);
+      };
+      const renderTemplate = (template) => new Promise((res, rej) => {
+        const tplId = id++;
+        // A template referencing a slow or missing entity must not stall the whole rebuild.
+        const timer = setTimeout(() => settleTpl(tplId, new Error('render_template timed out')), 10000);
+        timer.unref?.();
+        tplWaiters.set(tplId, { res, rej, timer });
+        try { ws.send(JSON.stringify({ id: tplId, type: 'render_template', template, report_errors: false })); }
+        catch (e) { settleTpl(tplId, e); }
+      });
+
       // Debounce bursts of edits (the editor can fire several saves) into one rebuild.
       const scheduleRecompute = (why) => {
         clearTimeout(recomputeTimer);
         recomputeTimer = setTimeout(async () => {
-          try { applyAllow(await buildAllow(rpc), `recomputed (${why})`); }
+          try { applyAllow(await buildAllow(rpc, renderTemplate), `recomputed (${why})`); }
           catch (e) { log('recompute failed:', e.message); }
         }, 1500);
       };
@@ -303,7 +365,7 @@ function startController() {
         if (m.type === 'auth_ok') {
           try {
             backoff = 1000; attempts = 0;
-            const next = await buildAllow(rpc);
+            const next = await buildAllow(rpc, renderTemplate);
             if (!settled) { ALLOW = next; settled = true; ALLOW_READY = true; resolve(ALLOW); }
             else applyAllow(next, 'recomputed (reconnect)', { merge: true });
             // lovelace_updated -> a dashboard's cards changed. The *_registry_updated
@@ -320,6 +382,16 @@ function startController() {
           }
           return;
         }
+        // First render of a template subscription -> hand it back and unsubscribe.
+        if (m.type === 'event' && tplWaiters.has(m.id)) {
+          settleTpl(m.id, null, m.event?.result ?? '');
+          return;
+        }
+        // An invalid template fails at `result` time and never emits an event.
+        if (m.type === 'result' && tplWaiters.has(m.id) && !m.success) {
+          settleTpl(m.id, new Error(m.error?.message || 'render_template failed'));
+          return;
+        }
         if (m.type === 'event' && WATCH_EVENTS.includes(m.event?.event_type)) {
           const ev = m.event.event_type;
           const why = ev === 'lovelace_updated' ? (m.event.data?.url_path ?? '(default)') : ev;
@@ -334,6 +406,7 @@ function startController() {
         if (gone) return; gone = true;
         if (e) logThrottled(`ctrl:${e.code || e.message}`, `control ws error: ${e.message}`);
         Object.values(pending).forEach(([, rej]) => rej(new Error('control ws closed')));
+        [...tplWaiters.keys()].forEach((k) => settleTpl(k, new Error('control ws closed')));
         const state = settled ? `serving last allowlist: ${ALLOW.size}` : 'waiting for HA to come up';
         logThrottled('ctrl-down', `control ws down; reconnecting in ${backoff}ms (${state})`);
         // Never exiting means a genuine misconfiguration (a host that doesn't resolve, a
@@ -361,11 +434,29 @@ function startController() {
 const proxy = httpProxy.createProxyServer({ target: HA_BASE, changeOrigin: true, ws: false, autoRewrite: true, xfwd: true });
 // Node reports dual-stack client IPs as IPv4-mapped IPv6 (e.g. ::ffff:192.168.5.247).
 // HA's trusted_networks auth provider matches plain IPv4 subnets, and a mapped address
-// won't match an IPv4 network — so normalize X-Forwarded-For to the bare IPv4 here, or
+// won't match an IPv4 network — so normalize X-Forwarded-For to bare IPv4, or
 // trusted-network (password-less) kiosk login silently falls through to a password prompt.
+//
+// Normalize IN PLACE, preserving the chain. This used to `setHeader('x-forwarded-for', ip)`,
+// replacing the whole chain with our immediate peer — which broke every setup with another
+// reverse proxy in front (issue #9). http-proxy's xfwd APPENDS our hop to all three headers,
+// so behind e.g. Caddy HA received:
+//     X-Forwarded-For:   <client>,<caddy>      (2 entries — then flattened by us to 1)
+//     X-Forwarded-Proto: https,http            (2 entries)
+// and HA's forwarded middleware raises HTTPBadRequest on
+//     `len(forwarded_proto) not in (1, len(forwarded_for))`
+// -> a hard 400 on every request. Keeping the chain intact keeps the counts in step, and
+// preserves the real client IP through the upstream proxy instead of hiding it behind Caddy.
+const normalizeXff = (v) => String(v).split(',').map((s) => s.trim().replace(/^::ffff:/, '')).filter(Boolean).join(', ');
 proxy.on('proxyReq', (proxyReq, req) => {
-  const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
-  if (ip) proxyReq.setHeader('x-forwarded-for', ip);
+  const xff = proxyReq.getHeader('x-forwarded-for') ?? req.headers['x-forwarded-for'];
+  if (xff) proxyReq.setHeader('x-forwarded-for', normalizeXff(xff));
+});
+// proxy.ws() never fires 'proxyReq' — it has its own event — so without this the websocket
+// upgrade would carry the un-normalized IPv4-mapped form that HTTP no longer does.
+proxy.on('proxyReqWs', (proxyReq, req) => {
+  const xff = proxyReq.getHeader('x-forwarded-for') ?? req.headers['x-forwarded-for'];
+  if (xff) proxyReq.setHeader('x-forwarded-for', normalizeXff(xff));
 });
 // Error arg is an http res for proxy.web() but a raw socket for proxy.ws() — handle both.
 proxy.on('error', (e, req, res) => {
@@ -481,7 +572,8 @@ function bridge(browserWs) {
   });
 
   function safeSend(s) { try { if (browserWs.readyState === 1) browserWs.send(s); } catch {} }
-  const close = () => { try { browserWs.close(); } catch {} try { haWs.close(); } catch {} };
+  const close = () => { openBridges.delete(close); try { browserWs.close(); } catch {} try { haWs.close(); } catch {} };
+  openBridges.add(close);            // so a grown allowlist can recycle this connection (#7)
   browserWs.on('close', close); browserWs.on('error', close);
   haWs.on('close', close);
   haWs.on('error', (e) => { logThrottled(`haws:${e.code || e.message}`, `HA ws error ${e.message}`); close(); });

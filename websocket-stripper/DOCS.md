@@ -111,9 +111,34 @@ keeps working out of the box.
   is computed generously (all views + template-referenced ids), but if something's
   missing add it via `always_forward`.
 - The allowlist is computed at startup and **rebuilt live** when a dashboard is saved (or a
-  registry changes) — no restart needed, but an already-open kiosk page must be reloaded to
-  pick up newly-added entities. Adding a whole new dashboard to `dashboards` still needs a
+  registry changes) — no restart needed. When the rebuild **adds** entities, open dashboard
+  connections are dropped so the frontend reconnects and picks them up on its own; no manual
+  kiosk reload. (Removals don't churn open connections — carrying a few entities you no
+  longer need is harmless.) Adding a whole new dashboard to `dashboards` still needs a
   restart, since options are read at boot.
+
+### auto-entities filter support
+
+Filter values accept the same forms auto-entities itself accepts — an exact id, a `*` glob
+(anchored), or a `/regex/` (**not** auto-anchored; include your own `^`/`$`) — on every key
+below, not just `entity_id`.
+
+| Key | Resolved how |
+|---|---|
+| `entity_id`, `domain` | matched directly |
+| `area`, `label`, `device`, `integration` | via the HA registries (matches id **or** name) |
+| `name` | against `friendly_name` |
+| `group` | expands to the group's members |
+| `template` | rendered through HA, then real entity ids are taken from the output |
+| `state`, `attributes` | deliberately **over-included** — an entity that doesn't match right now is still forwarded, so the card can show it when it later does |
+
+Entities are also pulled in **transitively through groups**: if a card names a group (or
+expands one client-side, e.g. `show_group_members`), its members are allowlisted even though
+they appear nowhere in the dashboard config.
+
+Still unsupported, and treated as matching nothing: `not`, `and`, `or`, `floor`,
+`device_manufacturer`, `device_model`, `last_changed`. If you rely on one of these, list the
+entities in `always_forward` and open an issue.
 - **Restarting Home Assistant is safe.** The add-on keeps running and waits: HTTP returns
   502 and `/api/websocket` is refused while core is down, then it reconnects, rebuilds the
   allowlist, and open dashboards recover on their own. The same applies at host boot, when

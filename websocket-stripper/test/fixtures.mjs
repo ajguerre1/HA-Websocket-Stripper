@@ -14,6 +14,16 @@ export const STATES = [
   { entity_id: 'sensor.humidity', state: '40', attributes: { unit_of_measurement: '%' } },
   { entity_id: 'switch.fan', state: 'on', attributes: {} },
   { entity_id: 'camera.front', state: 'streaming', attributes: {} },
+  // A group and its members. Only the GROUP is ever named in a dashboard; the members exist
+  // solely in its entity_id attribute, the way group-expanding cards work (issue #4).
+  { entity_id: 'cover.shade_group', state: 'open', attributes: { entity_id: ['cover.shade_left', 'cover.shade_right'] } },
+  { entity_id: 'cover.shade_left', state: 'open', attributes: {} },
+  { entity_id: 'cover.shade_right', state: 'closed', attributes: {} },
+  // PV sensors for the regex-filter repro (issue #10). `sensor.pv_total_energy` deliberately
+  // does NOT end in _power, so an anchored regex must exclude it.
+  { entity_id: 'sensor.pv_roof_power', state: '12', attributes: { friendly_name: 'PV Roof Power' } },
+  { entity_id: 'sensor.pv_shed_power', state: '3', attributes: { friendly_name: 'PV Shed Power' } },
+  { entity_id: 'sensor.pv_total_energy', state: '9', attributes: { friendly_name: 'PV Total Energy' } },
   // decoys — used by NO dashboard, must be trimmed away
   { entity_id: 'light.decoy', state: 'on', attributes: {} },
   { entity_id: 'sensor.decoy_power', state: '5', attributes: {} },
@@ -71,6 +81,28 @@ export const DASH_TEST = {
       ],
     },
   ],
+};
+
+// "group-dash": names ONLY the group entity. The members must come along via the group's
+// entity_id attribute — they appear nowhere in this config (issue #4, enhanced-shutter-card
+// with show_group_members).
+export const DASH_GROUP = {
+  title: 'Group',
+  views: [{ path: 'main', cards: [{ type: 'custom:enhanced-shutter-card', entities: [{ entity: 'cover.shade_group', show_group_members: true }] }] }],
+};
+
+// "tpl-dash": an auto-entities card whose entity list only exists after HA renders a Jinja
+// template (issue #4). The mock renders this to a card list naming the two PV power sensors.
+export const DASH_TEMPLATE = {
+  title: 'Template',
+  views: [{ path: 'main', cards: [{ type: 'custom:auto-entities', card: { type: 'vertical-stack' }, card_param: 'cards', filter: { template: 'PV_TEMPLATE' } }] }],
+};
+
+// "regex-dash": the issue #10 repro — an anchored regex on entity_id. Must resolve to the
+// two *_power sensors and NOT sensor.pv_total_energy.
+export const DASH_REGEX = {
+  title: 'Regex',
+  views: [{ path: 'main', cards: [{ type: 'custom:auto-entities', card: { type: 'entities' }, filter: { include: [{ entity_id: '/^sensor\\.pv_.*_power$/' }] } }] }],
 };
 
 // "auto-dash": an auto-entities card filtered by label (the #4 repro). Under the current

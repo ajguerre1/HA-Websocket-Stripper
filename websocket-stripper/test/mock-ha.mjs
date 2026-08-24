@@ -19,6 +19,8 @@ export function getFreePort() {
 }
 
 const DEFAULT_CONFIGS = { 'test-dash': DASH_TEST, 'auto-dash': DASH_AUTO };
+// render_template bodies, keyed by the template source the config asks for.
+const DEFAULT_TEMPLATES = { PV_TEMPLATE: "[{'entity': 'sensor.pv_roof_power'}, {'entity': 'sensor.pv_shed_power'}]" };
 
 const DEFAULT_REGISTRIES = {
   'config/area_registry/list': AREAS,
@@ -29,7 +31,7 @@ const DEFAULT_REGISTRIES = {
 
 // `port` pins the listen port so a test can take HA down and bring it back on the same
 // address — i.e. simulate an HA restart under a running proxy.
-export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, registries = DEFAULT_REGISTRIES, port: fixedPort } = {}) {
+export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, registries = DEFAULT_REGISTRIES, templates = DEFAULT_TEMPLATES, port: fixedPort } = {}) {
   const port = fixedPort ?? await getFreePort();
   configs = { ...configs };    // per-mock copy, so a setConfig() in one test can't leak into the next
   const state = {
@@ -37,6 +39,9 @@ export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, 
     httpHits: [],
     conns: new Set(),          // { ws, eventSubs:Map<event_type,id>, entitySubIds:Set }
     lastSubscribeEntities: null,
+    renderedTemplates: [],       // template sources the proxy asked HA to render
+    unsubscribed: [],            // subscription ids the proxy released
+    hangTemplates: false,        // accept render_template, never push the event
     hangUpgrades: false,       // accept the TCP connection, never answer the upgrade
     rawUpgrades: new Set(),
     sockets: new Set(),        // EVERY accepted socket, so close() can't hang (see close())
@@ -99,6 +104,22 @@ export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, 
           state.lastSubscribeEntities = m.entity_ids ?? null;
           conn.entitySubIds.add(m.id);
           return ok(null);
+        // Real HA answers render_template with an empty `result`, THEN pushes the rendered
+        // text as an event on the same id (it's a subscription, re-firing on every change).
+        // The proxy must take that first event and unsubscribe.
+        case 'render_template': {
+          state.renderedTemplates.push(m.template);
+          const body = templates[m.template];
+          if (body === undefined) {
+            return ws.send(JSON.stringify({ id: m.id, type: 'result', success: false, error: { code: 'template_error', message: `unknown template: ${m.template}` } }));
+          }
+          ok(null);
+          if (state.hangTemplates) return;             // never answers — exercises the timeout
+          return setTimeout(() => { try { ws.send(JSON.stringify({ id: m.id, type: 'event', event: { result: body, listeners: {} } })); } catch {} }, 5);
+        }
+        case 'unsubscribe_events':
+          state.unsubscribed.push(m.subscription);
+          return ok(null);
         default: return ok(null);
       }
     });
@@ -113,6 +134,9 @@ export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, 
     state,
     lastSubscribeEntities: () => state.lastSubscribeEntities,
     lastXFF: () => state.lastXFF,
+    renderedTemplates: () => state.renderedTemplates,
+    unsubscribed: () => state.unsubscribed,
+    setHangTemplates(v) { state.hangTemplates = v; },
     // Push an entity event on every active subscribe_entities subscription.
     pushEntityEvent(payload) {
       for (const c of state.conns) {

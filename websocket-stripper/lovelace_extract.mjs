@@ -14,26 +14,64 @@
 //                      (state/attributes) shrink the set — an entity that doesn't match a
 //                      `state:` filter right now must still be forwarded so the card can
 //                      show it when it later does.
+//   opts.renderedTemplates : Map<templateString, renderedText> for `filter.template` cards.
+//                      Collect the templates with collectTemplates(), render them through
+//                      HA, and pass the results back in (this module can't render itself).
 
 const ID_RE = /^[a-z_][a-z0-9_]*\.[a-z0-9_]+$/;
 export const isEntityId = (s) => typeof s === 'string' && ID_RE.test(s);
 
-function globToRe(glob) {
-  // HA auto-entities globs: * matches any run of chars.
-  const esc = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-  return new RegExp('^' + esc + '$');
+// Port of auto-entities' own `matcher()` (src/match.ts). EVERY filter key upstream runs its
+// value through this — not just entity_id — so globs and regexes work on domain/area/label/
+// device/integration/name alike. The two forms differ in anchoring, which matters:
+//   "/^sensor\.pv_.*_power$/"  -> RegExp("^sensor\.pv_.*_power$")   UNanchored by us; the
+//                                 user supplies their own anchors inside the slashes.
+//   "sensor.pv_*"              -> RegExp("^sensor\.pv_.*$")         globs are anchored.
+//   "sensor.foo"               -> exact string equality.
+// Previously only the glob form existed, and a /regex/ was escaped as literal text — so
+// `/^sensor\.pv_.*_power$/` compiled to `^/\^sensor\\\.pv_.*_power\$/$` and matched nothing
+// (issue #10). Upstream ORs the regex against exact equality, so we do too.
+export function toMatcher(pattern) {
+  if (typeof pattern !== 'string') return (v) => v === pattern;
+  const tests = [];
+  if ((pattern.startsWith('/') && pattern.endsWith('/') && pattern.length > 1) || pattern.includes('*')) {
+    let p = pattern;
+    // Glob -> anchored regex. Escape regex metacharacters EXCEPT `*`, which becomes `.*`.
+    // (Upstream's own glob branch forgets to escape `.`; we escape it, which is stricter but
+    // only ever in the safe direction for an allowlist.)
+    if (!p.startsWith('/')) p = `/^${p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$/`;
+    try {
+      const re = new RegExp(p.slice(1, -1));
+      tests.push((v) => typeof v === 'string' && re.test(v));
+    } catch { /* an unparseable regex simply contributes no matches */ }
+  }
+  tests.push((v) => v === pattern);
+  return (v) => tests.some((t) => t(v));
 }
 
 const asArray = (v) => (Array.isArray(v) ? v : [v]);
 
-// A filter value may be a plain string, an array, or — from the auto-entities visual
-// editor — an object like `{ label: "1st_floor", active_choice: "label" }`. Pull the
-// effective value(s) for filter key `key`.
+// A filter value may be a plain string, an array, or — from HA's selector UI — an object
+// that records which input mode was used, e.g. `{ label: "1st_floor", active_choice: "label" }`
+// or `{ custom: "input_boolean.bypass_*", active_choice: "custom" }`. `active_choice` names
+// the key holding the real value, so prefer it; fall back to the filter key itself.
+// Without this an object stringifies to "[object Object]" and matches nothing.
 function coerceVal(v, key) {
   if (v == null) return [];
   if (Array.isArray(v)) return v.flatMap((x) => coerceVal(x, key));
-  if (typeof v === 'object') return key in v ? coerceVal(v[key], key) : [];
+  if (typeof v === 'object') {
+    const pick = typeof v.active_choice === 'string' && v.active_choice in v ? v.active_choice
+      : key in v ? key : null;
+    return pick ? coerceVal(v[pick], key) : [];
+  }
   return [v];
+}
+
+// Build a predicate for filter key `key` from its (possibly editor-wrapped) value: the value
+// matches if ANY of its alternatives matches, via the auto-entities matcher.
+function valMatcher(v, key) {
+  const ms = coerceVal(v, key).map((x) => toMatcher(typeof x === 'string' ? x : String(x)));
+  return (s) => ms.some((m) => m(s));
 }
 
 // Build entity -> {area, labels, device, integration} lookups from the registries.
@@ -73,40 +111,61 @@ function condTests(cond, unsupported, ctx) {
   const volatile = [];
   const reg = (s) => ctx.ent && ctx.ent.get(s.entity_id);
 
+  // Each key matches via the auto-entities matcher, so globs and regexes work everywhere
+  // (issue #10). Registry-backed keys match against BOTH the id and the human name, the way
+  // upstream does — `area: Kitchen` and `area: kitchen_area_id` both resolve.
   if (cond.domain != null) {
-    const doms = asArray(cond.domain);
-    structural.push((s) => doms.includes(s.entity_id.split('.')[0]));
+    const m = valMatcher(cond.domain, 'domain');
+    structural.push((s) => m(s.entity_id.split('.')[0]));
   }
   if (cond.entity_id != null) {
-    const res = asArray(cond.entity_id).map((g) => globToRe(String(g)));
-    structural.push((s) => res.some((re) => re.test(s.entity_id)));
+    const m = valMatcher(cond.entity_id, 'entity_id');
+    structural.push((s) => m(s.entity_id));
   }
   if (cond.area != null) {
-    const want = new Set(coerceVal(cond.area, 'area').map(String));
-    structural.push((s) => { const r = reg(s); return !!r && (want.has(r.areaId) || want.has(r.areaName)); });
+    const m = valMatcher(cond.area, 'area');
+    structural.push((s) => { const r = reg(s); return !!r && (m(r.areaId) || m(r.areaName)); });
   }
   if (cond.label != null) {
-    const want = new Set(coerceVal(cond.label, 'label').map(String));
-    structural.push((s) => { const r = reg(s); return !!r && (r.labelIds.some((id) => want.has(id)) || r.labelNames.some((n) => want.has(n))); });
+    const m = valMatcher(cond.label, 'label');
+    structural.push((s) => { const r = reg(s); return !!r && (r.labelIds.some(m) || r.labelNames.some(m)); });
   }
   if (cond.device != null) {
-    const want = new Set(coerceVal(cond.device, 'device').map(String));
-    structural.push((s) => { const r = reg(s); return !!r && (want.has(r.deviceId) || want.has(r.deviceName)); });
+    const m = valMatcher(cond.device, 'device');
+    structural.push((s) => { const r = reg(s); return !!r && (m(r.deviceId) || m(r.deviceName)); });
   }
   if (cond.integration != null) {
-    const want = new Set(coerceVal(cond.integration, 'integration').map(String));
-    structural.push((s) => { const r = reg(s); return !!r && want.has(r.platform); });
+    const m = valMatcher(cond.integration, 'integration');
+    structural.push((s) => { const r = reg(s); return !!r && m(r.platform); });
   }
-  if (cond.state != null) volatile.push((s) => s.state === cond.state);
+  // Upstream matches `name` against friendly_name. Structural, not volatile: a friendly name
+  // is stable identity, unlike state — treating it as volatile would forward the whole
+  // instance for any card whose only filter is a name.
+  if (cond.name != null) {
+    const m = valMatcher(cond.name, 'name');
+    structural.push((s) => m(s.attributes?.friendly_name));
+  }
+  // `group: group.foo` -> the members listed in that group's entity_id attribute.
+  if (cond.group != null) {
+    const want = coerceVal(cond.group, 'group').map(String);
+    const members = new Set();
+    for (const g of want) {
+      const st = ctx.byId?.get(g);
+      for (const e of asArray(st?.attributes?.entity_id ?? [])) if (isEntityId(e)) members.add(e);
+    }
+    structural.push((s) => members.has(s.entity_id));
+  }
+  if (cond.state != null) { const m = toMatcher(cond.state); volatile.push((s) => m(s.state)); }
   if (cond.attributes && typeof cond.attributes === 'object') {
     for (const [k, v] of Object.entries(cond.attributes)) {
-      volatile.push((s) => s.attributes && s.attributes[k] === v);
+      const m = toMatcher(v);
+      volatile.push((s) => s.attributes && m(s.attributes[k]));
     }
   }
 
-  // Flag conditions we don't evaluate (name/group/not/and/or/last_changed/templates/…).
-  const known = ['domain', 'entity_id', 'area', 'label', 'device', 'integration',
-    'state', 'attributes', 'options', 'type', 'active_choice'];
+  // Flag conditions we don't evaluate (not/and/or/last_changed/floor/device_model/…).
+  const known = ['domain', 'entity_id', 'area', 'label', 'device', 'integration', 'name',
+    'group', 'state', 'attributes', 'options', 'type', 'active_choice', 'sort'];
   for (const k of Object.keys(cond)) {
     if (!known.includes(k)) unsupported.push('auto-entities filter key: ' + k);
   }
@@ -135,8 +194,56 @@ function makeMatcher(cond, unsupported, ctx, role, overInclude) {
   return (s) => tests.every((t) => t(s));
 }
 
+// `filter.template` is a Jinja template that HA renders into the card list, so its entity
+// ids only exist after rendering — a structural walk can never see them (issue #4). We can't
+// render here (this module is sync and has no HA connection), so the caller pre-renders via
+// HA's `render_template` and passes the results in as opts.renderedTemplates. We then scrape
+// real entity ids out of the rendered text, which works whether the template returns a list
+// of ids or a list of card objects.
+export function collectTemplates(config) {
+  const out = new Set();
+  const walk = (node) => {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (!node || typeof node !== 'object') return;
+    if (typeof node.filter?.template === 'string') out.add(node.filter.template);
+    for (const v of Object.values(node)) if (v && typeof v === 'object') walk(v);
+  };
+  walk(Array.isArray(config?.views) ? config.views : []);
+  return [...out];
+}
+
+// Groups (and group-expanding cards like enhanced-shutter-card's `show_group_members`) name
+// only the group entity in the config; the members live in the group's `entity_id` attribute
+// at runtime and appear nowhere in the dashboard (issue #4). Pull them in transitively so a
+// group on the allowlist brings its members with it. Bounded in case a group cycles.
+export function expandGroupMembers(ids, allStates = [], maxDepth = 5) {
+  const byId = new Map(allStates.map((s) => [s.entity_id, s]));
+  const out = new Set(ids);
+  let frontier = [...out];
+  for (let d = 0; d < maxDepth && frontier.length; d++) {
+    const next = [];
+    for (const id of frontier) {
+      const members = byId.get(id)?.attributes?.entity_id;
+      if (!Array.isArray(members)) continue;
+      for (const e of members) if (isEntityId(e) && !out.has(e)) { out.add(e); next.push(e); }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
 function expandAutoEntities(node, allStates, add, unsupported, ctx, overInclude) {
   const f = node.filter || {};
+  // A rendered template contributes every real entity id in its output.
+  if (typeof f.template === 'string') {
+    const rendered = ctx.templates?.get(f.template);
+    if (rendered == null) unsupported.push('auto-entities filter key: template (not rendered)');
+    // Only REAL ids: rendered output can contain incidental dotted words, and a template is
+    // free-form text rather than a structured filter.
+    else for (const m of String(rendered).matchAll(/[a-z_][a-z0-9_]*\.[a-z0-9_]+/g)) {
+      if (ctx.byId.has(m[0])) add(m[0]);
+    }
+  }
   const inc = Array.isArray(f.include) ? f.include : [];
   const exc = Array.isArray(f.exclude) ? f.exclude : [];
   const excMatchers = exc.map((c) => makeMatcher(c, unsupported, ctx, 'exclude', overInclude));
@@ -158,6 +265,10 @@ export function extractEntities(config, allStates = [], opts = {}) {
   const unsupported = [];
   const add = (id) => { if (isEntityId(id)) found.add(id); };
   const ctx = buildRegistryCtx(opts.registries);
+  // Live state by id: needed for `group:` membership and to validate ids scraped out of a
+  // rendered template. Templates come pre-rendered from the caller (see collectTemplates).
+  ctx.byId = new Map(allStates.map((s) => [s.entity_id, s]));
+  ctx.templates = opts.renderedTemplates instanceof Map ? opts.renderedTemplates : new Map();
   const overInclude = !!opts.overInclude;
 
   function walk(node) {

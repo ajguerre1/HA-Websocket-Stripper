@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.2.3 — 2026-08-23
+
+Filter resolution and reverse-proxy fixes, all from reported issues.
+
+**auto-entities globs and regexes now work on every filter key** (#10). Only `*` globs were
+ever understood, and a `/regex/` was escaped as literal text — so `/^sensor\.pv_.*_power$/`
+compiled to `^/\^sensor\\\.pv_.*_power\$/$` and matched nothing, leaving those cards
+"unavailable". The matcher is now a port of auto-entities' own (`src/match.ts`): a `/regex/`
+is used as-is and deliberately **not** anchored, a glob is anchored, otherwise exact
+equality. Crucially it now applies to **every** key — `domain`, `area`, `label`, `device`,
+`integration`, `name` — not just `entity_id`, matching upstream.
+
+**HA's selector object form is understood for `entity_id` and `domain`** (#4). The visual
+editor stores values as `{ custom: "input_boolean.bypass_*", active_choice: "custom" }`.
+That was handled for `area`/`label`/`device`/`integration` but not for `entity_id`/`domain`,
+where it stringified to `"[object Object]"` and matched nothing.
+
+**`filter: template:` cards resolve** (#4). Their entity list only exists after HA renders
+the Jinja, so a structural walk could never see it. The proxy now renders those templates
+over its existing control connection (`render_template`, taking the first result and
+unsubscribing) and takes the real entity ids from the output. A template that errors or
+times out contributes nothing and no longer affects the rest of the dashboard.
+
+**Group members are pulled in transitively** (#4). A card naming only a group — or expanding
+one client-side, like `enhanced-shutter-card`'s `show_group_members` — left every member
+stripped, because the members appear nowhere in the dashboard config. Any allowlisted entity
+now contributes its `entity_id` attribute members. The auto-entities `group:` and `name:`
+filter keys are supported for the same reason.
+
+**The X-Forwarded-For chain is preserved** (#9). The handler that normalizes IPv4-mapped IPv6
+used `setHeader`, replacing the whole chain with our immediate peer. Since http-proxy
+*appends* our hop to all three forwarded headers, anything running another reverse proxy in
+front (Caddy, nginx, Traefik) sent HA `X-Forwarded-For` with 1 entry and `X-Forwarded-Proto`
+with 2 — and HA's forwarded middleware raises `HTTPBadRequest` on
+`len(forwarded_proto) not in (1, len(forwarded_for))`. Result: a hard **400 on every request**
+through the add-on while `:8123` worked fine. Entries are now normalized in place, so the
+counts stay in step and the real client IP survives the upstream hop (which also lets
+`trusted_networks` see the browser rather than the proxy). The same normalization now applies
+to websocket upgrades, which never fired the HTTP-only hook.
+
+**Open dashboards pick up a grown allowlist by themselves** (#7). `subscribe_entities` is
+sent once per connection and HA can't amend a live subscription, so a rebuild only ever
+affected *new* connections — an already-open kiosk kept its original entity list until
+someone reloaded the tab. When a rebuild **adds** entities, affected connections are now
+dropped; the frontend treats that as an ordinary disconnect and reconnects against the
+current allowlist. Removals deliberately don't churn open connections.
+
+Tests: 44 → 75.
+
 ## 0.2.2 — 2026-07-29
 
 **An empty allowlist is never forwarded as "no filter".** HA parses `subscribe_entities` as
