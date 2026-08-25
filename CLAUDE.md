@@ -50,13 +50,32 @@ upgrade handler now forwards them via `proxy.ws()`.
 Union, across all configured dashboards, of:
 1. `extractEntities()` (`lovelace_extract.mjs`) — walks the card tree for entities in the
    standard keys (`entity`, `entities`, `entity_id`, `camera_image`, …) across **all
-   views**, and expands `auto-entities` filter cards against live states.
+   views**, and expands `auto-entities` filter cards against live states + registries.
 2. every **real** entity id that appears anywhere in the dashboard config text — catches
    ids referenced inside `button-card` / `mushroom-template` / `decluttering-card`
    templates that a structural walk can't parse.
 
-Then `+ always_forward`, then `- never_forward` (never wins). Over-inclusion is harmless
+Then `+ always_forward`, then `- never_forward` (never wins), then **group members**
+(`expandGroupMembers`, transitive via `attributes.entity_id`). Over-inclusion is harmless
 (still tiny vs the instance); under-inclusion makes a card show "unavailable".
+
+### auto-entities filter resolution (`condTests` / `toMatcher`)
+
+`toMatcher()` is a deliberate port of auto-entities' own `src/match.ts` — keep it that way
+rather than inventing semantics. A `/regex/` is used **unanchored** (the author supplies
+`^`/`$`); a `*` glob is anchored; otherwise exact equality; regex is OR'd with exact match.
+It applies to **every** filter key, which is what upstream does — that was issue #10.
+
+Supported keys: `entity_id`, `domain`, `area`, `label`, `device`, `integration`, `name`
+(vs `friendly_name`), `group`, `template`, `state`/`attributes` (volatile → over-included).
+Values may also arrive in HA's selector object form `{ custom: …, active_choice: 'custom' }`;
+`coerceVal` uses `active_choice` to pick the real key. Still unsupported: `not`/`and`/`or`,
+`floor`, `device_manufacturer`, `device_model`, `last_changed`.
+
+`filter: template:` is rendered over the control ws (`collectTemplates` → `render_template`
+→ real ids scraped from the output). Note `render_template` is a **subscription**: HA answers
+`result: null` then pushes events, so `renderTemplate()` takes the first event and
+unsubscribes. Don't route it through `rpc()`, which resolves on `result`.
 
 ## Files
 
@@ -103,11 +122,13 @@ HA_TOKEN="<token>" HA_BASE="http://homeassistant.mgmt:8123" \
 - **Allowlist recomputes live on dashboard edits.** A persistent control ws (`startController`
   in `ha_ws_trim_proxy.mjs`) builds the allowlist at boot, then subscribes to HA's
   `lovelace_updated` event and rebuilds (debounced 1.5 s) on every dashboard save, with
-  reconnect-on-drop. So editing a dashboard's cards no longer needs an add-on restart — but
-  the recompute only affects **new** ws connections, so an already-open kiosk page must be
-  **reloaded** to pick up newly-added entities (the add-on itself doesn't restart). Adding a
-  whole new dashboard to the `dashboards` option still needs a restart (options are read at
-  boot). If the control ws can't reconnect, the proxy keeps serving the last-known allowlist.
+  reconnect-on-drop. So editing a dashboard's cards no longer needs an add-on restart. A
+  recompute still only affects **new** ws connections (HA can't amend a live
+  `subscribe_entities`), so since 0.2.3 a rebuild that **adds** entities drops the open
+  bridges — the frontend reconnects itself and re-subscribes, no manual kiosk reload.
+  Removals deliberately don't churn connections. Adding a whole new dashboard to the
+  `dashboards` option still needs a restart (options are read at boot). If the control ws
+  can't reconnect, the proxy keeps serving the last-known allowlist.
 - **Registries (entity/device/area) are not trimmed** yet — they pass through full. If
   load is still heavy after entity trimming, trimming/caching these is the next lever.
 - **Reachability:** the add-on must resolve `http://homeassistant:8123`. `host_network: true`
@@ -142,6 +163,16 @@ HA_TOKEN="<token>" HA_BASE="http://homeassistant.mgmt:8123" \
   local add-on bakes code into the image at build time (`COPY` in the Dockerfile), so code
   changes need a **Rebuild**, not a Restart; config.yaml `host_network` also needs Rebuild,
   and `http:`/`auth_providers` need a full **Core restart** (not a YAML quick-reload).
+- **Never flatten the X-Forwarded-For chain — CONFIRMED FIXED 0.2.3, verified live by a user
+  behind Caddy.** The normalization above was originally written as
+  `proxyReq.setHeader('x-forwarded-for', ip)`, which *replaced* the whole chain with our
+  immediate peer. `http-proxy`'s `xfwd` **appends** our hop to XFF, XFP and X-Forwarded-Port,
+  so with any upstream reverse proxy HA received XFF=1 entry and XFP=2, and
+  `forwarded.py` raises `HTTPBadRequest` on
+  `len(forwarded_proto) not in (1, len(forwarded_for))` → a hard **400 on every request**
+  (issue #9). Normalize each entry **in place**; never rebuild the header from a single IP.
+  Also note `proxy.ws()` does NOT fire `proxyReq` — the ws path needs its own `proxyReqWs`
+  handler or upgrades silently keep the `::ffff:` form.
 
 ## Security
 

@@ -48,29 +48,46 @@ The **allowlist** is the union of the entities used by each configured dashboard
 scan for entity ids referenced inside templates), plus your `always_forward` and minus
 your `never_forward` overrides.
 
-`auto-entities` filter cards are expanded against your live entities **and registries**, so
-filters by `area`, `label`, `device`, and `integration` resolve the same way HA's frontend
-does (not just `domain` / `entity_id`). Volatile `state` / `attributes` filters
-over-include — an entity that doesn't match right now is still forwarded so the card can
-show it when it later does. The allowlist **recomputes live** when you edit a dashboard or
-change area/label/device assignments (no add-on restart needed); already-open kiosk pages
-just need a reload to pick up newly-added entities.
+`auto-entities` filter cards are expanded against your live entities **and registries**, the
+same way HA's frontend resolves them:
+
+| Filter key | Resolved how |
+|---|---|
+| `entity_id`, `domain` | matched directly |
+| `area`, `label`, `device`, `integration` | via the HA registries (matches id **or** name) |
+| `name` | against `friendly_name` |
+| `group` | expands to the group's members |
+| `template` | rendered through HA, then real entity ids are taken from the output |
+| `state`, `attributes` | **over-included** — an entity that doesn't match right now is still forwarded, so the card shows it when it later does |
+
+Every one of those accepts an exact id, a `*` glob (anchored), or a `/regex/` (**not**
+auto-anchored — supply your own `^`/`$`), matching auto-entities' own behaviour. Entities are
+also pulled in **transitively through groups**, so a card naming a group — or expanding one
+client-side, like `enhanced-shutter-card`'s `show_group_members` — gets its members too, even
+though they appear nowhere in the dashboard config.
+
+The allowlist **recomputes live** when you edit a dashboard or change area/label/device
+assignments — no add-on restart, and no kiosk reload either: when a rebuild *adds* entities,
+open dashboard connections are dropped so the frontend reconnects and picks them up on its
+own.
 
 ## Install as a Home Assistant add-on
 
 1. HA → **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, add:
    `https://github.com/GabrielGoldsteinAnidea/HA-Websocket-Stripper`
-2. Install **WebSocket Stripper**, open **Configuration**, set your dashboards:
+2. Install **WebSocket Stripper**, open **Configuration**, and set `dashboards` to your own
+   dashboards' `url_path` values (Settings → Dashboards). It ships **empty** — until you set
+   it, the add-on refuses `/api/websocket` and says so in the log, rather than silently
+   serving the untrimmed firehose:
    ```yaml
    dashboards:
-     - fridge-status
-     - home-status
-     - dashboard-deck
-   always_forward: []          # e.g. ["/^sun\\./", "person.gabriel"]
+     - kitchen-panel           # <-- your dashboards' url_path values
+     - hallway-kiosk
+   always_forward: []          # e.g. ["/^sun\\./", "person.alex"]
    never_forward: []           # e.g. ["/_battery$/"]
    strip_entities: true
    ```
-3. Start it. Browse `http://<ha-host>:8099/fridge-status`. Point your kiosk/fridge browser
+3. Start it. Browse `http://<ha-host>:8099/<your-dashboard>`. Point your kiosk browser
    there. To move it off `8099` (e.g. it collides with Zigbee2MQTT), set the `port` option
    — because the add-on runs `host_network: true`, the **Network** tab can't remap it.
 
@@ -98,7 +115,8 @@ that right has two subtle requirements, both handled by this add-on out of the b
    Host networking lets the add-on see the real browser IP.
 2. **The add-on forwards that IP via `X-Forwarded-For`, normalized to plain IPv4** (built
    in). Node reports dual-stack clients as IPv4-mapped IPv6 (`::ffff:192.168.1.50`), which
-   won't match an IPv4 `trusted_networks` subnet; the add-on strips that prefix for you.
+   won't match an IPv4 `trusted_networks` subnet; the add-on strips that prefix for you, on
+   both HTTP requests and websocket upgrades.
 
 Because of `host_network`, HA sees the proxied request coming from the **host itself**, so
 trust the host (not the add-on docker subnet) in your HA `configuration.yaml`:
@@ -135,6 +153,29 @@ changes, not a YAML quick-reload).
 > `homeassistant`/`supervisor` hostnames), set the `ha_base` / `allow_ws_url` options to
 > pin them to IPs, e.g. `ha_base: http://192.168.1.2:8123`.
 
+## Behind another reverse proxy (Caddy / nginx / Traefik, HTTPS)
+
+Putting your own reverse proxy in front of the add-on works — useful for TLS termination and
+external access, and required for browser features that only work on a secure origin (mic
+input for Assist, for instance).
+
+The add-on **preserves the `X-Forwarded-For` chain** rather than replacing it, so HA sees the
+real browser IP through both hops and `trusted_networks` still matches the kiosk, not your
+edge proxy. Make sure HA trusts every hop:
+
+```yaml
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - 127.0.0.1               # the stripper (reaches HA from the host, via host_network)
+    - ::1
+    - 192.168.1.5             # your Caddy / nginx host, if it's a different machine
+```
+
+> **Note:** versions before 0.2.3 flattened that chain, which made HA reject every proxied
+> request with **400 Bad Request** (`Incorrect number of elements in X-Forward-Proto`) while
+> a direct connection to `:8123` worked fine. If you hit that, update.
+
 ## Run locally (dev, no add-on)
 
 ```bash
@@ -142,10 +183,13 @@ cd websocket-stripper
 npm install
 HA_TOKEN="<long-lived-token>" \
   HA_BASE="http://homeassistant.mgmt:8123" \
-  DASH_PATHS="fridge-status,home-status,dashboard-deck" \
+  DASH_PATHS="kitchen-panel,hallway-kiosk" \
   node ha_ws_trim_proxy.mjs
-# then open http://localhost:8099/fridge-status
+# then open http://localhost:8099/kitchen-panel
 ```
+
+Run `npm test` for the suite (extractor + registry/filter resolution unit tests, plus
+integration tests that drive the real proxy against a mock HA).
 
 Set `STRIP_ENTITIES=0` to passthrough untrimmed for an A/B load comparison.
 
@@ -153,24 +197,53 @@ Set `STRIP_ENTITIES=0` to passthrough untrimmed for an A/B load comparison.
 
 - The frontend JS bundles still load (and are cached after first visit); this targets the
   per-load entity firehose, which is the part that scales with instance size.
-- The allowlist **recomputes live** on dashboard edits and registry changes. Adding a whole
-  new dashboard to the `dashboards` option still needs an add-on restart (options are read
-  at boot). An already-open kiosk page must be **reloaded** to pick up newly-added entities.
+- The allowlist **recomputes live** on dashboard edits and registry changes, and open kiosk
+  pages reconnect themselves when it grows. Adding a whole new dashboard to the `dashboards`
+  option still needs an add-on restart (options are read at boot).
 - Each recompute logs the exact `+added` / `-removed` entity diff, so you can see from the
   add-on log what a dashboard edit changed.
+- **Restarting Home Assistant is safe.** The add-on stays up and waits: HTTP degrades to 502
+  while core is down, then it reconnects, rebuilds, and open dashboards recover on their own.
+  Same at host boot, when the add-on starts before core is listening.
+- Cards can still show "unavailable" if a filter type isn't supported yet — currently `not`,
+  `and`, `or`, `floor`, `device_manufacturer`, `device_model`, `last_changed`. List those
+  entities in `always_forward` and open an issue.
+- A **local** add-on bakes the code into its image at build time, so updates need a
+  **Rebuild**, not a Restart.
 - See `CLAUDE.md` for architecture/decisions and `websocket-stripper/DOCS.md` for option
   details.
 
-## What's new in 0.2.0
+## What's new in 0.2.3
 
 Full history in [`websocket-stripper/CHANGELOG.md`](websocket-stripper/CHANGELOG.md).
 
-- **auto-entities `area` / `label` / `device` / `integration` filters now resolve** against
-  the registries — cards filtered by label/area no longer show entities as "unavailable,"
-  and you don't have to hand-list them in `always_forward`. Volatile `state` / `attributes`
-  filters over-include so cards still update as state changes.
+- **auto-entities globs and regexes work on every filter key** — `/^sensor\.pv_.*_power$/`
+  and friends resolve instead of matching nothing, on `domain` / `area` / `label` / `device`
+  / `integration` / `name`, not just `entity_id`.
+- **`filter: template:` cards resolve** — rendered through HA rather than skipped.
+- **Group members are pulled in transitively**, so cards that expand a group client-side
+  (`show_group_members`) stop showing their members as "unavailable".
+- **Fixed 400 Bad Request behind another reverse proxy** — the `X-Forwarded-For` chain is
+  preserved, so Caddy / nginx / Traefik in front of the add-on works.
+- **Open dashboards pick up new entities by themselves** — no more reloading every wall panel
+  after a dashboard edit.
+
+### 0.2.2 — important if you're upgrading from ≤ 0.2.1
+
+- **An empty allowlist is never forwarded as "no filter" again.** HA reads
+  `set(msg["entity_ids"]) or None`, so an empty `entity_ids` meant *no filter at all* — and
+  because `dashboards` used to default to the author's own dashboards, a fresh install
+  resolved nothing and relayed **every entity on the instance**, the exact opposite of the
+  point. `dashboards` now defaults to `[]` and the websocket is refused (with the reason
+  logged) rather than sending an empty filter.
+- **Surviving an HA restart** — the add-on no longer crash-loops when core goes away.
+
+### 0.2.0
+
+- **auto-entities `area` / `label` / `device` / `integration` filters resolve** against the
+  registries, so you don't have to hand-list them in `always_forward`.
 - **Configurable `port` option** — coexist with other add-ons on busy hosts.
-- **Recompute now logs the `+added` / `-removed` entity diff**, not just the total.
+- **Recompute logs the `+added` / `-removed` entity diff**, not just the total.
 - **Defensive egress filter** re-filters `subscribe_entities` event payloads to the
   allowlist on the way to the browser — a belt-and-suspenders guarantee the firehose can't
   leak even if a future HA ignored the subscription filter.
