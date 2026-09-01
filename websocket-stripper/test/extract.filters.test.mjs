@@ -141,4 +141,36 @@ describe('group membership expansion (issue #4)', () => {
     assert.deepEqual([...expandGroupMembers(['group.a'], cyclic)].sort(),
       ['group.a', 'group.b', 'light.kitchen']);
   });
+
+  // A group's member list can outlive its members: an entity is renamed or removed and
+  // nothing rewrites the lists pointing at it. `isEntityId` is only a shape test, so those
+  // ids used to enter the allowlist and inflate every count the proxy reports.
+  test('a member that no longer exists is not forwarded', () => {
+    const stale = [
+      { entity_id: 'light.hallway', state: 'off', attributes: { entity_id: ['light.hallway_1', 'light.hallway_2'] } },
+      { entity_id: 'light.hallway_1', state: 'off', attributes: {} },
+      // light.hallway_2 was renamed away; the group's list still names it
+    ];
+    assert.deepEqual([...expandGroupMembers(['light.hallway'], stale)].sort(),
+      ['light.hallway', 'light.hallway_1']);
+  });
+
+  test('a group whose whole member list is dead contributes nothing', () => {
+    const allDead = [
+      { entity_id: 'light.dining', state: 'on', attributes: { entity_id: ['light.dining_1', 'light.dining_2'] } },
+    ];
+    assert.deepEqual([...expandGroupMembers(['light.dining'], allDead)], ['light.dining']);
+  });
+
+  // Transitive expansion must not be stopped by a dead id in the middle of a chain: the
+  // live members below it are still needed.
+  test('a dead member does not break expansion of its live siblings', () => {
+    const mixed = [
+      { entity_id: 'group.top', state: 'on', attributes: { entity_id: ['light.gone', 'group.inner'] } },
+      { entity_id: 'group.inner', state: 'on', attributes: { entity_id: ['light.kitchen'] } },
+      { entity_id: 'light.kitchen', state: 'on', attributes: {} },
+    ];
+    assert.deepEqual([...expandGroupMembers(['group.top'], mixed)].sort(),
+      ['group.inner', 'group.top', 'light.kitchen']);
+  });
 });

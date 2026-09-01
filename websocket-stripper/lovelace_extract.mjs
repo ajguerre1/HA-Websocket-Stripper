@@ -216,6 +216,18 @@ export function collectTemplates(config) {
 // only the group entity in the config; the members live in the group's `entity_id` attribute
 // at runtime and appear nowhere in the dashboard (issue #4). Pull them in transitively so a
 // group on the allowlist brings its members with it. Bounded in case a group cycles.
+//
+// A member must actually EXIST. `isEntityId` is only a shape test, and a group's member list
+// can outlive its members — an entity is renamed or removed and nothing rewrites the lists that
+// point at it. Those ids then enter the allowlist, match nothing, and inflate every count the
+// proxy reports. Measured on one instance: 87 light groups listing 409 dead members put 239
+// phantom ids into a 772-entity allowlist — 31% of it. Harmless to forward (an entry matching
+// no entity forwards nothing), but it makes `allowlist: N entities` wrong by a third, and that
+// is the number people tune the `dashboards` option against.
+//
+// Every other path into the allowlist is already gated on the id being real: the config-text
+// scrape in ha_ws_trim_proxy.mjs checks `real.has()`, and the rendered-template scrape below
+// checks `ctx.byId.has()`. This was the one that was not.
 export function expandGroupMembers(ids, allStates = [], maxDepth = 5) {
   const byId = new Map(allStates.map((s) => [s.entity_id, s]));
   const out = new Set(ids);
@@ -225,7 +237,7 @@ export function expandGroupMembers(ids, allStates = [], maxDepth = 5) {
     for (const id of frontier) {
       const members = byId.get(id)?.attributes?.entity_id;
       if (!Array.isArray(members)) continue;
-      for (const e of members) if (isEntityId(e) && !out.has(e)) { out.add(e); next.push(e); }
+      for (const e of members) if (isEntityId(e) && byId.has(e) && !out.has(e)) { out.add(e); next.push(e); }
     }
     frontier = next;
   }
