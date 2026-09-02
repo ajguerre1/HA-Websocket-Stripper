@@ -217,13 +217,19 @@ export function collectTemplates(config) {
 // at runtime and appear nowhere in the dashboard (issue #4). Pull them in transitively so a
 // group on the allowlist brings its members with it. Bounded in case a group cycles.
 //
-// A member must actually EXIST. `isEntityId` is only a shape test, and a group's member list
-// can outlive its members — an entity is renamed or removed and nothing rewrites the lists that
-// point at it. Those ids then enter the allowlist, match nothing, and inflate every count the
-// proxy reports. Measured on one instance: 87 light groups listing 409 dead members put 239
-// phantom ids into a 772-entity allowlist — 31% of it. Harmless to forward (an entry matching
-// no entity forwards nothing), but it makes `allowlist: N entities` wrong by a third, and that
-// is the number people tune the `dashboards` option against.
+// A member must be IN THE STATE MACHINE. `isEntityId` is only a shape test, and a group's
+// `entity_id` attribute lists members by id whether or not HA is currently serving them — most
+// often because the member is DISABLED, and also if it has been removed or renamed. A disabled
+// entity is a perfectly valid registry entry; it simply has no state, so HA will never stream
+// it and allowlisting it can only ever be dead weight.
+//
+// Measured on one instance: 87 Hue room/zone groups listed 409 member ids that `get_states`
+// does not return, putting 239 of them into a 772-entity allowlist — 31% of it. Checked rather
+// than assumed: all 239 were present in the entity registry and all were disabled
+// (`disabled_by: device`, the devices disabled by the user) — deliberate curation to control
+// entity count, not stale data. Harmless to forward (an entry matching no entity forwards
+// nothing), but it makes `allowlist: N entities` wrong by a third, and that is the number
+// people tune the `dashboards` option against.
 //
 // Every other path into the allowlist is already gated on the id being real: the config-text
 // scrape in ha_ws_trim_proxy.mjs checks `real.has()`, and the rendered-template scrape below
